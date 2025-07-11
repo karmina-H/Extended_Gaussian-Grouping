@@ -82,10 +82,14 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     :param lambda_val: 손실 가중치
     :param max_points: 다운샘플링을 위한 최대 포인트 수
     :param sample_size: 손실계산에 사용할 샘플 포인트 수 
+
+    3D 포인트 클라우드에서 이웃 포인트들 간의 클래스 일관성을 위한 손실 계산
+    - top-k neighbors과 KL divergence를 이용
     
     :return: Computed loss value.
     """
     # Conditionally downsample if points exceed max_points
+    # 포인트 수가 max_points를 초과하는 경우 다운샘플링
     if features.size(0) > max_points:
         indices = torch.randperm(features.size(0))[:max_points]
         features = features[indices]
@@ -93,15 +97,17 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
 
 
     # Randomly sample points for which we'll compute the loss
+    # 손실 계산을 위한 랜덤 샘플링
     indices = torch.randperm(features.size(0))[:sample_size]
     sample_features = features[indices]
     sample_preds = predictions[indices]
 
-    # Compute top-k nearest neighbors directly in PyTorch
+    #torch.cdist를 사용하여 샘플 포인트와 전체 포인트 간의 유클리드 거리를 계산. 
     dists = torch.cdist(sample_features, features)  # Compute pairwise distances
+    #topk를 사용해 가장 작은 k개의 거리와 해당 인덱스를 찾음. (largest=False는 작은 값 우선).
     _, neighbor_indices_tensor = dists.topk(k, largest=False)  # Get top-k smallest distances
 
-    # Fetch neighbor predictions using indexing
+    # 이웃 예측값 가져오기
     neighbor_preds = predictions[neighbor_indices_tensor]
 
     # kl divergence계산

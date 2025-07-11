@@ -29,15 +29,18 @@ from scipy.spatial import ConvexHull, Delaunay
 from render import feature_to_rgb, visualize_obj
 
 def points_inside_convex_hull(point_cloud, mask, remove_outliers=True, outlier_factor=1.0):
+    #이거 사용하는 이유가 inpainting할 때 필요한 영역을 정확하게 식별하기 위해서 사용함
+    #convex hull을 통해서 객체의 경계를 자연스럽게 정의함
     """
     Given a point cloud and a mask indicating a subset of points, this function computes the convex hull of the 
     subset of points and then identifies all points from the original point cloud that are inside this convex hull.
     
     Parameters:
-    - point_cloud (torch.Tensor): A tensor of shape (N, 3) representing the point cloud.
-    - mask (torch.Tensor): A tensor of shape (N,) indicating the subset of points to be used for constructing the convex hull.
-    - remove_outliers (bool): Whether to remove outliers from the masked points before computing the convex hull. Default is True.
-    - outlier_factor (float): The factor used to determine outliers based on the IQR method. Larger values will classify more points as outliers.
+    - point_cloud (torch.Tensor): 포인트 클라우드를 나타내는 (N, 3) 형태의 텐서
+    - mask (torch.Tensor): 포인트 서브셋을 지정하는 (N,) 형태의 불리언 마스크
+    - remove_outliers (bool): 이상치 제거 여부 (기본값: True)
+    - outlier_factor (float): IQR 방식의 이상치 판별을 위한 계수 (기본값: 1.0)
+    
     
     Returns:
     - inside_hull_tensor_mask (torch.Tensor): A mask of shape (N,) with values set to True for the points inside the convex hull 
@@ -45,35 +48,46 @@ def points_inside_convex_hull(point_cloud, mask, remove_outliers=True, outlier_f
     """
 
     # Extract the masked points from the point cloud
+    # 마스크된 포인트 추출
     masked_points = point_cloud[mask].cpu().numpy()
 
-    # Remove outliers if the option is selected
+    # Remove outliers if the option is selected - 이상치 제거(옵션)
     if remove_outliers:
+        # IQR 방식으로 이상치 제거
         Q1 = np.percentile(masked_points, 25, axis=0)
         Q3 = np.percentile(masked_points, 75, axis=0)
         IQR = Q3 - Q1
+        # 이상치 판별을 위한 마스크 생성
         outlier_mask = (masked_points < (Q1 - outlier_factor * IQR)) | (masked_points > (Q3 + outlier_factor * IQR))
         filtered_masked_points = masked_points[~np.any(outlier_mask, axis=1)]
     else:
         filtered_masked_points = masked_points
 
     # Compute the Delaunay triangulation of the filtered masked points
+    #  Delaunay 삼각분할 수행
     delaunay = Delaunay(filtered_masked_points)
 
     # Determine which points from the original point cloud are inside the convex hull
+    # 모든 포인트에 대해 내부 여부 확인
     points_inside_hull_mask = delaunay.find_simplex(point_cloud.cpu().numpy()) >= 0
 
     # Convert the numpy mask back to a torch tensor and return
+    # NumPy 마스크를 PyTorch 텐서로 변환
     inside_hull_tensor_mask = torch.tensor(points_inside_hull_mask, device='cuda')
 
     return inside_hull_tensor_mask
 
 def removal_setup(opt, model_path, iteration, views, gaussians, pipeline, background, classifier, selected_obj_ids, cameras_extent, removal_thresh):
     selected_obj_ids = torch.tensor(selected_obj_ids).cuda()
+    # 제거할 객체의 3D 마스크 생성
     with torch.no_grad():
+        # # 객체 특징을 분류기에 입력
         logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
+        # 확률값으로 변환
         prob_obj3d = torch.softmax(logits3d,dim=0)
+        # 선택된 객체에 대한 마스크 생성
         mask = prob_obj3d[selected_obj_ids, :, :] > removal_thresh
+        # Convex Hull을 사용한 마스크 확장
         mask3d = mask.any(dim=0).squeeze()
 
         mask3d_convex = points_inside_convex_hull(gaussians._xyz.detach(),mask3d,outlier_factor=1.0)

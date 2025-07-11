@@ -53,6 +53,7 @@ def divide_into_patches(image, K):
 def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, background, classifier, selected_obj_ids, cameras_extent, removal_thresh, finetune_iteration):
 
     # get 3d gaussians idx corresponding to select obj id
+    # 제거할 객체의 3D 마스크 생성(라벨링 데이터 가지고)
     with torch.no_grad():
         logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
         prob_obj3d = torch.softmax(logits3d,dim=0)
@@ -64,49 +65,57 @@ def finetune_inpaint(opt, model_path, iteration, views, gaussians, pipeline, bac
         mask3d = mask3d.float()[:,None,None]
 
     # fix some gaussians
-    gaussians.inpaint_setup(opt,mask3d)
+    gaussians.inpaint_setup(opt,mask3d) #이거 해서 마스크부분 제거하고 제거한 부분 가우시안 포인트 추가
     iterations = finetune_iteration
     progress_bar = tqdm(range(iterations), desc="Finetuning progress")
+    # LPIPS 손실 함수 초기화
     LPIPS = lpips.LPIPS(net='vgg')
     for param in LPIPS.parameters():
         param.requires_grad = False
     LPIPS.cuda()
 
-
+    # 학습루프
     for iteration in range(iterations):
+        # 랜덤 뷰포인트 선택
         viewpoint_stack = views.copy()
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # 현재 상태 렌더링
         render_pkg = render(viewpoint_cam, gaussians, pipeline, background)
         image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
-
+        # 2D 마스크 및 GT 이미지 준비
         mask2d = viewpoint_cam.objects > 128
         gt_image = viewpoint_cam.original_image.cuda()
+        # L1 손실 계산
         Ll1 = masked_l1_loss(image, gt_image, ~mask2d)
 
+        # 바운딩 박스 계산 및 크롭
         bbox = mask_to_bbox(mask2d)
         cropped_image = crop_using_bbox(image, bbox)
         cropped_gt_image = crop_using_bbox(gt_image, bbox)
+        # 패치 분할 및 LPIPS 손실 계산
+        # 여기서 패치크기 2*2사용해서했는데 아마 grouping된 객체가 전체 이미지보다 훨씬 작은으니까 기존16*16->2*2로 줄여서 사용한듯
         K = 2
         rendering_patches = divide_into_patches(cropped_image[None, ...], K)
         gt_patches = divide_into_patches(cropped_gt_image[None, ...], K)
         lpips_loss = LPIPS(rendering_patches.squeeze()*2-1,gt_patches.squeeze()*2-1).mean()
-
+        # 전체 손실 계산 및 역전파
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * lpips_loss
         loss.backward()
-
+        # 가우시안 업데이트
         with torch.no_grad():
             if iteration < 5000 :
                 # Keep track of max radii in image-space for pruning
+                # 2D 반경 추적
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
+                # 주기적인 밀도 조정
                 if  iteration % 300 == 0:
                     size_threshold = 20 
                     gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, cameras_extent, size_threshold)
                 
         gaussians.optimizer.step()
         gaussians.optimizer.zero_grad(set_to_none = True)
-
+        # 진행 상황 업데이트
         if iteration % 10 == 0:
             progress_bar.set_postfix({"Loss": f"{loss:.{7}f}"})
             progress_bar.update(10)
@@ -176,11 +185,23 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
 def inpaint(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, opt : OptimizationParams, select_obj_id : int, removal_thresh : float,  finetune_iteration: int):
+    '''
+    dataset: ModelParams,          # 모델 관련 파라미터
+    iteration: int,                # 로드할 체크포인트 반복 횟수
+    pipeline: PipelineParams,      # 파이프라인 파라미터
+    skip_train: bool,              # 학습 세트 렌더링 스킵 여부
+    skip_test: bool,               # 테스트 세트 렌더링 스킵 여부
+    opt: OptimizationParams,       # 최적화 파라미터
+    select_obj_id: int,            # 인페인팅할 객체 ID
+    removal_thresh: float,         # 객체 제거 임계값
+    finetune_iteration: int        # 미세조정 반복 횟수
+    '''
     # 1. load gaussian checkpoint
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
     num_classes = dataset.num_classes
     print("Num classes: ",num_classes)
+    # 분류기 초기화 및 로드
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
     classifier.cuda()
     classifier.load_state_dict(torch.load(os.path.join(dataset.model_path,"point_cloud","iteration_"+str(scene.loaded_iter),"classifier.pth")))
@@ -189,12 +210,14 @@ def inpaint(dataset : ModelParams, iteration : int, pipeline : PipelineParams, s
 
 
     # 2. inpaint selected object
+    #선택된 객체 인페인트
     gaussians = finetune_inpaint(opt, dataset.model_path, scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, classifier, select_obj_id, scene.cameras_extent, removal_thresh, finetune_iteration)
 
     # 3. render new result
     dataset.object_path = 'object_mask'
     dataset.images = 'images'
     scene = Scene(dataset, gaussians, load_iteration='_object_inpaint/iteration_'+str(finetune_iteration-1), shuffle=False)
+    #결과저장
     with torch.no_grad():
         if not skip_train:
              render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, classifier)
