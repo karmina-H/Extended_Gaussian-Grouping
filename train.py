@@ -24,31 +24,42 @@ import json
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
+    # output하고 log용 폴더및 파일생성
     prepare_output_and_logger(dataset)
+    #가우시안 모델 초기화
     gaussians = GaussianModel(dataset.sh_degree)
+    # 가우시안 모델 초기화한걸로 scene도 초기화
     scene = Scene(dataset, gaussians)
+    # 기본 옵티마이저 설정
     gaussians.training_setup(opt)
+    # 가우시안 그룹핑용 num_classes할당
     num_classes = dataset.num_classes
     print("Num classes: ",num_classes)
+    # classifier용 단층 cnn인스턴스, input_size = num_objects, output_size = num_classes
     classifier = torch.nn.Conv2d(gaussians.num_objects, num_classes, kernel_size=1)
     cls_criterion = torch.nn.CrossEntropyLoss(reduction='none')
     cls_optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-4)
     classifier.cuda()
+    # 기존에 학습하던게 있으면 불러오는거
     if checkpoint:
         (model_params, first_iter) = torch.load(checkpoint)
         gaussians.restore(model_params, opt)
 
+    #배경 색상 설정( 흰색 or 검은색) -> 텐서로 변환해서 gpu에 로드
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
+    # 학습시간 측정하는 변수
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+
+    #진행 바 초기화
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):       
+        #시각화 관련 
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -64,41 +75,55 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             except Exception as e:
                 network_gui.conn = None
 
+        #학습 시간측정 시작
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
+        # 학습1000iteration마다 sh차수 증가(더 고차원표현학습가능)
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
 
-        # Pick a random Camera
+        # 첫 train시작이면 scene에서 카메라 가져오기
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
+        # 무작위로 카메라 list에서 카메라 하나 가져오고pop
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
+
+        #무작위로 선택한 카메라로 현재 3D 모델을 랜더링함.
+        # render함수 = 3d 가우시안 모델을 특정시점의 카메라에서 바라본 것을 2D 이미지로 변환하는 역할
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
 
         # Object Loss
+        # gt_obj = 현재 카메라 시점에서 촬영된 이미지의 정답 객체 ID 맵
         gt_obj = viewpoint_cam.objects.cuda().long()
+        # 렌더링된 객체 정보(objects)맵을 입력으로 받아 각 픽셀이 특정 객체 클래스에 속할 확률 또는 점수(logits)를 출력
         logits = classifier(objects)
         loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
+        # 손실값을 num_class로 정규화
         loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
 
         # Loss
+        # GT이미지와 랜더결과의 L1 손실값 계산.
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
 
         loss_obj_3d = None
+        # 특정 iteration마다 loss_cls_3d적용
         if iteration % opt.reg3d_interval == 0:
             # regularize at certain intervals
+            # _objects_dc = [pcd개수, 1, num_objects] -> [num_objects, pcd개수, 1]
             logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
             prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
+            # loss_cls_3d=가까운 객체일수록 가우시안이 비슷하다는 가정에 기반한 loss
             loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
+            # total_loss = l1_loss + ssim_loss + labeling_loss + 3d_obj_loss
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
         else:
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj

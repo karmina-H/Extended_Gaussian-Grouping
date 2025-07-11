@@ -76,12 +76,12 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     Compute the neighborhood consistency loss for a 3D point cloud using Top-k neighbors
     and the KL divergence.
     
-    :param features: Tensor of shape (N, D), where N is the number of points and D is the dimensionality of the feature.
-    :param predictions: Tensor of shape (N, C), where C is the number of classes.
-    :param k: Number of neighbors to consider.
-    :param lambda_val: Weighting factor for the loss.
-    :param max_points: Maximum number of points for downsampling. If the number of points exceeds this, they are randomly downsampled.
-    :param sample_size: Number of points to randomly sample for computing the loss.
+    :param features:  (N, D)형태의 포인트 특징 텐서(N=포인트수, d = 특징차원)
+    :param predictions:  (N, C) 형태의 클래스 예측 텐서( c = 클래스수)
+    :param k: 고려할 최근점 이웃의 수
+    :param lambda_val: 손실 가중치
+    :param max_points: 다운샘플링을 위한 최대 포인트 수
+    :param sample_size: 손실계산에 사용할 샘플 포인트 수 
     
     :return: Computed loss value.
     """
@@ -104,7 +104,7 @@ def loss_cls_3d(features, predictions, k=5, lambda_val=2.0, max_points=200000, s
     # Fetch neighbor predictions using indexing
     neighbor_preds = predictions[neighbor_indices_tensor]
 
-    # Compute KL divergence
+    # kl divergence계산
     kl = sample_preds.unsqueeze(1) * (torch.log(sample_preds.unsqueeze(1) + 1e-10) - torch.log(neighbor_preds + 1e-10))
     loss = kl.sum(dim=-1).mean()
 
